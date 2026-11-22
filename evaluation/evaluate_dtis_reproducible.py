@@ -1,14 +1,3 @@
-"""Reproducible binary-segmentation evaluation for DTIS experiments.
-
-The manuscript-facing primary endpoint is the patient/case-level macro Dice.
-Micro Dice/IoU are emitted as explicitly named secondary endpoints and must not
-be put in a table column labelled only "Dice" or "mIoU".
-
-The evaluator is deliberately independent from nnU-Net so the same protocol can
-be applied to every baseline. It writes a machine-readable JSON summary and a
-per-case CSV, including input file hashes and the complete command line.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -93,7 +82,6 @@ def _metrics(case_id: str, pred: np.ndarray, gt: np.ndarray,
         value = 1.0 if empty_policy == "perfect" else 0.0
         dice = iou = value
     else:
-        # A non-empty prediction against empty GT is a complete failure.
         dice = 2.0 * tp / float(2 * tp + fp + fn)
         iou = tp / float(tp + fp + fn)
     return CaseMetrics(case_id, dice, iou, tp, fp, fn, tn,
@@ -107,7 +95,6 @@ def _percentile_ci(values: np.ndarray, rng: np.random.Generator,
     if n_bootstrap <= 0:
         return [float("nan"), float("nan")]
     draws = np.empty(n_bootstrap, dtype=np.float64)
-    # Chunking keeps memory bounded even for large test sets.
     for start in range(0, n_bootstrap, 512):
         size = min(512, n_bootstrap - start)
         idx = rng.integers(0, values.size, size=(size, values.size))
@@ -127,24 +114,24 @@ def _aggregate(rows: Sequence[CaseMetrics], seed: int, n_bootstrap: int,
     tp = sum(r.tp for r in rows)
     fp = sum(r.fp for r in rows)
     fn = sum(r.fn for r in rows)
-    micro_dice = 2.0 * tp / float(2 * tp + fp + fn) if 2 * tp + fp + fn else 1.0
-    micro_iou = tp / float(tp + fp + fn) if tp + fp + fn else 1.0
+    dice = 2.0 * tp / float(2 * tp + fp + fn) if 2 * tp + fp + fn else 1.0
+    miou = tp / float(tp + fp + fn) if tp + fp + fn else 1.0
     return {
-        "primary_endpoint": "case_macro_dice",
+        "primary_endpoint": "case_dice",
         "n_cases_evaluated": len(rows),
         "n_cases_both_empty": sum(r.both_empty for r in rows),
-        "case_macro_dice": {
+        "case_dice": {
             "mean": float(dice.mean()), "std": float(dice.std(ddof=1)) if len(rows) > 1 else 0.0,
             "median": float(np.median(dice)),
             "bootstrap_ci": _percentile_ci(dice, rng, n_bootstrap, confidence),
         },
-        "case_macro_iou": {
+        "case_miou": {
             "mean": float(iou.mean()), "std": float(iou.std(ddof=1)) if len(rows) > 1 else 0.0,
-            "median": float(np.median(iou)),
+            "median": float(np.median(miou)),
             "bootstrap_ci": _percentile_ci(iou, rng, n_bootstrap, confidence),
         },
-        "secondary_micro_dice": float(micro_dice),
-        "secondary_micro_iou": float(micro_iou),
+        "secondary_dice": float(dice),
+        "secondary_iou": float(miou),
         "confusion_totals": {"tp": tp, "fp": fp, "fn": fn,
                              "tn": sum(r.tn for r in rows)},
     }
@@ -160,8 +147,6 @@ def _paired_comparison(first: Sequence[CaseMetrics], second: Sequence[CaseMetric
     dice_diff = np.asarray([a[i].dice - b[i].dice for i in ids])
     iou_diff = np.asarray([a[i].iou - b[i].iou for i in ids])
     rng = np.random.default_rng(seed)
-    # Exact sign-flip is intractable for large n; a fixed-seed Monte Carlo
-    # paired randomization test is deterministic and distribution-free.
     n_perm = max(10_000, n_bootstrap)
     observed = abs(float(dice_diff.mean()))
     extreme = 0
@@ -172,11 +157,11 @@ def _paired_comparison(first: Sequence[CaseMetrics], second: Sequence[CaseMetric
     return {
         "orientation": "first_minus_second",
         "n_paired_cases": len(ids),
-        "macro_dice_difference": float(dice_diff.mean()),
-        "macro_dice_difference_bootstrap_ci": _percentile_ci(
+        "dice_difference": float(dice_diff.mean()),
+        "dice_difference_bootstrap_ci": _percentile_ci(
             dice_diff, rng, n_bootstrap, confidence),
-        "macro_iou_difference": float(iou_diff.mean()),
-        "macro_iou_difference_bootstrap_ci": _percentile_ci(
+        "mIou_difference": float(iou_diff.mean()),
+        "mIou_difference_bootstrap_ci": _percentile_ci(
             iou_diff, rng, n_bootstrap, confidence),
         "paired_randomization_p_dice_two_sided": float((extreme + 1) / (n_perm + 1)),
         "n_randomizations": n_perm,
