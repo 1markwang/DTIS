@@ -1,39 +1,9 @@
-# -*- coding: utf-8 -*-
-"""Utilities for loading case-aligned text *token-sequence* cache files.
-
-Unlike `text_cache_utils.py` (which stores ONE 1-D [CLS] vector per case for
-the bottleneck text branch), this module stores the FULL per-token hidden
-states `(L, D)` for a case's report. These are consumed by the multi-scale
-text token cross-attention injected into the decoder (V7 / DRIS multi-scale).
-
-Rationale
----------
-The QaTa-COV19 reports are templated but DO carry coarse localisation, e.g.
-"... upper left lung and lower right lung". Pooling them into a single [CLS]
-vector (the bottleneck branch) discards the per-word spatial cues that a
-decoder-stage cross-attention can route to the correct region. Keeping the
-full token sequence lets words like "upper"/"left"/"lower" be attended to
-spatially at 14x14 / 28x28 decoder resolutions.
-
-Cache root resolution order (first non-empty wins):
-    1. PCAT_TEXT_TOKEN_CACHE_ROOT env var   (explicit absolute override)
-    2. nnUNet_raw / NNUNET_RAW env var       (-> <raw>/../text_token_cache/<dataset>)
-    3. PCAT_PROJECT_ROOT env var             (-> <root>/nnunetv2_data/text_token_cache/<dataset>)
-    4. Current working directory             (-> ./nnunetv2_data/text_token_cache/<dataset>)
-
-Each `.npy` file holds a 2-D float32 array of shape (L, D): L tokens (incl.
-[CLS]/[SEP]) by D hidden dims (768 for BERT-family encoders). Empty reports
-are stored as a single zero row (1, D) so cross-attention never receives an
-all-masked key set (which would produce NaNs).
-"""
-
 from __future__ import annotations
 
 import functools
 import os
 from pathlib import Path
 from typing import Optional
-
 import numpy as np
 
 
@@ -76,12 +46,6 @@ def text_token_cache_path(case_id: str) -> Path:
 
 @functools.lru_cache(maxsize=None)
 def _load_text_tokens_raw(case_id: str) -> np.ndarray:
-    """Cached low-level loader (one disk read per process per case_id).
-
-    Token sequences are short (reports < ~40 tokens). At D=768 a 40-token
-    case is ~120 KB; even 10 k cases stay well under ~1.2 GB worst-case, and
-    in practice each data-loader worker only touches its shard.
-    """
     path = text_token_cache_path(case_id)
     if not path.exists():
         raise FileNotFoundError(
@@ -102,27 +66,6 @@ def _load_text_tokens_raw(case_id: str) -> np.ndarray:
 
 
 def load_text_tokens(case_id: str, expected_dim: Optional[int] = None) -> np.ndarray:
-    """Load a single (L, D) token-sequence array, in-memory cached.
-
-    Parameters
-    ----------
-    case_id : str
-        Case identifier, matching the segmentation case naming.
-    expected_dim : Optional[int]
-        If set, validate that the hidden dim D equals this value.
-
-    Returns
-    -------
-    np.ndarray, shape (L, D), float32 with L >= 1.
-
-    Raises
-    ------
-    FileNotFoundError
-        If the cache file is missing.
-    ValueError
-        If the cached array is not 2-D, has L == 0, or its hidden dim differs
-        from `expected_dim` when one is supplied.
-    """
     seq = _load_text_tokens_raw(str(case_id))
     if seq.shape[0] < 1:
         raise ValueError(
@@ -139,7 +82,6 @@ def load_text_tokens(case_id: str, expected_dim: Optional[int] = None) -> np.nda
 
 
 def clear_text_token_cache() -> None:
-    """Drop every (case_id -> token-sequence) entry from the in-memory LRU."""
     _load_text_tokens_raw.cache_clear()
 
 
