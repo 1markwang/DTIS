@@ -1,16 +1,3 @@
-"""Convert case-aligned density caches into nnUNet channel-1 images.
-
-The previous bridge loaded a full density map by case id after nnUNet had
-already cropped/augmented the image. That breaks spatial correspondence. This
-one-time migration writes ``<case>_0001.png`` next to every ``_0000.png`` so
-nnUNet owns both modalities from preprocessing through sliding-window
-inference.
-
-The command is non-destructive by default: existing channel-1 images are
-validated and retained. ``dataset.json`` is updated only after every channel-0
-image has a matching density file.
-"""
-
 from __future__ import annotations
 
 import argparse
