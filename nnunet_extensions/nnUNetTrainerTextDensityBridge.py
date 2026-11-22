@@ -1,33 +1,9 @@
-# -*- coding: utf-8 -*-
-"""nnUNetv2 trainer for the image-anchored dual-path (text + density) bridge.
-
-Usage:
-    nnUNetv2_train <DATASET> <CONFIG> <FOLD> -tr nnUNetTrainerTextDensityBridge
-    nnUNetv2_train <DATASET> <CONFIG> <FOLD> -tr nnUNetTrainerTextDensityBridge_100epochs
-
-Both density and text are loaded via their case-id-aligned caches at
-forward time (no I/O changes to the official nnUNet data loader). When
-the cache for a modality is missing, that path is silently disabled and
-training continues with whichever modalities ARE available — useful when
-text annotations cover only a subset of cases.
-
-The total loss is:
-    L = L_seg(output, target) + align_weight * align_loss
-
-where align_loss is the cosine-distance alignment between pooled image
-bottleneck features and the per-branch encoded features. Set
-`align_weight` to 0 to disable the alignment term.
-"""
-
 from __future__ import annotations
-
 from os.path import join
 from pydoc import locate
 from typing import List, Optional
-
 import torch
 import torch.nn as nn
-
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
 from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
@@ -41,32 +17,15 @@ from nnunetv2.utilities.plans_handling.plans_handler import (
     PlansManager,
 )
 
-
-# Default text-embedding dim. PubMedBERT / BioBERT / BERT-base are all 768.
-# Override per subclass if you use a different encoder.
 DEFAULT_TEXT_DIM = 768
-# Increased from 0.1 -> 0.5. With alpha now starting at 1.0 (no tanh) and
-# out_proj zero-initialised, the bridge branches start contributing
-# immediately; a stronger alignment signal is needed to keep
-# density/text bottleneck features aligned with the image features so that
-# the additive contribution remains useful rather than noisy.
 DEFAULT_ALIGN_WEIGHT = 0.5
 
 
 class nnUNetTrainerTextDensityBridge(nnUNetTrainer):
-    """Official nnUNetv2 trainer that builds the dual-path bridge network."""
-
     text_in_dim: int = DEFAULT_TEXT_DIM
     align_loss_weight: float = DEFAULT_ALIGN_WEIGHT
-    # Save an INDEPENDENT (non-overwriting) checkpoint every this many epochs,
-    # in addition to the EMA-pseudo-dice-based `checkpoint_best.pth`. Set to 0
-    # to disable. Used so we can evaluate real Mean Validation Dice on every
-    # mid/late-training snapshot after training and pick the truly best one
-    # (EMA pseudo dice is patch-aggregated and can overestimate by 0.05-0.13).
     ckpt_save_interval: int = 10
-
-    # --- network -----------------------------------------------------------
-
+    
     @staticmethod
     def build_network_architecture(
         plans_manager: PlansManager,
@@ -115,26 +74,14 @@ class nnUNetTrainerTextDensityBridge(nnUNetTrainer):
             align_loss_weight=float(nnUNetTrainerTextDensityBridge.align_loss_weight),
         )
 
-    # --- optimizer ----------------------------------------------------------
-
+  
     def configure_optimizers(self):
-        """Build SGD with the bridge's `alpha` scalars excluded from weight decay.
-
-        The bridge uses learnable per-branch gates (`fusion.ca_density.alpha`,
-        `fusion.ca_text.alpha`). They are single scalars and are critical
-        for letting the additive cross-attention branches contribute. They
-        must NOT decay toward zero; doing so was the main failure mode of
-        the previous configuration (`alpha` stayed near 0 for 60+ epochs).
-        """
         decay_params: List[nn.Parameter] = []
         no_decay_params: List[nn.Parameter] = []
         no_decay_names: List[str] = []
         for name, p in self.network.named_parameters():
             if not p.requires_grad:
                 continue
-            # Exclude any module-level 'alpha' scalar from weight decay.
-            # Also exclude 1-D buffers like norm/bias to follow common
-            # PyTorch best practice (small effect on nnUNet but harmless).
             if name.endswith(".alpha") or p.ndim <= 1:
                 no_decay_params.append(p)
                 no_decay_names.append(name)
@@ -162,17 +109,7 @@ class nnUNetTrainerTextDensityBridge(nnUNetTrainer):
                 self.print_to_log_file(f"[bridge] no-decay alpha param: {n}")
         return optimizer, lr_scheduler
 
-    # --- periodic independent checkpoint ----------------------------------
-
     def on_epoch_end(self):
-        """Override to additionally save an independent (epoch-tagged) ckpt
-        every `ckpt_save_interval` epochs. The base class already handles
-        `checkpoint_latest.pth` and `checkpoint_best.pth`; we just persist
-        extra snapshots without overwriting them.
-        """
-        # Determine which epoch is about to be "completed" (super() will then
-        # advance self.current_epoch). Match base class semantics that uses
-        # `(current_epoch + 1) % save_every == 0` BEFORE the increment.
         epoch_just_finished = self.current_epoch
         super().on_epoch_end()
 
@@ -180,7 +117,6 @@ class nnUNetTrainerTextDensityBridge(nnUNetTrainer):
             return
         if self.local_rank != 0 or self.disable_checkpointing:
             return
-        # Skip the very last epoch — base class will save `checkpoint_final.pth`.
         if epoch_just_finished == self.num_epochs - 1:
             return
         if (epoch_just_finished + 1) % self.ckpt_save_interval == 0:
@@ -188,8 +124,6 @@ class nnUNetTrainerTextDensityBridge(nnUNetTrainer):
             self.save_checkpoint(join(self.output_folder, ckpt_name))
             self.print_to_log_file(
                 f"[periodic-save] saved independent ckpt: {ckpt_name}")
-
-    # --- batch handling ----------------------------------------------------
 
     def _extract_inputs(self, batch: dict):
         if "image" in batch:
@@ -229,8 +163,6 @@ class nnUNetTrainerTextDensityBridge(nnUNetTrainer):
             return [t.to(self.device, non_blocking=True) for t in target]
         return target.to(self.device, non_blocking=True)
 
-    # --- train / val steps -------------------------------------------------
-
     def train_step(self, batch: dict) -> dict:
         image, density, text, case_ids = self._extract_inputs(batch)
         target = batch["target"]
@@ -243,17 +175,12 @@ class nnUNetTrainerTextDensityBridge(nnUNetTrainer):
         target = self._move_target(target)
 
         self.optimizer.zero_grad(set_to_none=True)
-        # NOTE: never `torch.no_grad()` in a training step -- that breaks
-        # the autograd graph on non-CUDA devices. nnUNet's standard
-        # `dummy_context()` is a no-op that preserves gradients.
         ctx = (torch.autocast(self.device.type, enabled=True)
                if self.device.type == 'cuda' else dummy_context())
         with ctx:
             output = self.network(image=image, density=density, text=text,
                                    case_id=case_ids)
             l_seg = self.loss(output, target)
-            # DDP / torch.compile wraps `self.network` so custom methods
-            # (`pop_alignment_loss`) live on the *inner* module. Unwrap.
             net_inner = unwrap_network(self.network)
             l_align = net_inner.pop_alignment_loss() if hasattr(
                 net_inner, "pop_alignment_loss") else None
@@ -335,61 +262,19 @@ class nnUNetTrainerTextDensityBridge(nnUNetTrainer):
             "tp_hard": tp_hard, "fp_hard": fp_hard, "fn_hard": fn_hard,
         }
 
-    # --- final validation: inject case_id into the predictor path ---------
 
     def perform_actual_validation(self, save_probabilities: bool = False):
-        """Override to make `nnUNetPredictor`'s sliding-window inference
-        aware of the current case_id, so the bridge network can load
-        density / text from cache during final validation.
-
-        Problem solved
-        --------------
-        `nnUNetPredictor._internal_maybe_mirror_and_predict` calls
-        `self.network(x)` positional-only, so the bridge sees
-        `case_id=None` and skips both density and text branches. The
-        reported "Mean Validation Dice" then secretly reflects an
-        IMAGE-ONLY model -- regardless of how strongly multimodal the
-        training was. (Concrete evidence: V5 had FAR_d=0.26 and Pseudo
-        Dice 0.8606 at training time but the same 0.789 final Val Dice
-        as image-only V31, because the predictor never saw the density
-        cache.)
-
-        Injection strategy (chosen for minimal LoC over copy-pasting
-        ~130 lines of the parent method)
-        --------------------------------
-        Temporarily SUBCLASS `self.dataset_class` so that its
-        `load_case(k)` method sticky-sets `case_id=k` on the bridge
-        network before returning the data. The parent's case loop calls
-        `dataset_val.load_case(k)` exactly once per case, so this fires
-        right before the first `predictor.predict_sliding_window(...)`
-        call for that case -- precisely the right moment.
-
-        Cleanup is RAII-safe: `try/finally` restores the original class
-        and clears the sticky id even if the parent method raises.
-        """
-        # Resolve the inner module so we can call its sticky API even
-        # under DDP / torch.compile wrappers.
         inner = unwrap_network(self.network)
         if not hasattr(inner, "set_inference_case_id"):
-            # Architecture without sticky-case-id support -> fall back to
-            # parent (image-only final val). Should not happen with our
-            # `TextDensityBridgePlainConvUNet`.
             return super().perform_actual_validation(save_probabilities)
 
         base_cls = self.dataset_class
         if base_cls is None:
-            # Trainer was never fully initialised; let the parent raise
-            # the proper error message.
             return super().perform_actual_validation(save_probabilities)
 
         network_ref = inner  # captured by the subclass below
 
         class _CaseIdAwareDataset(base_cls):
-            """Wrapper that sticky-sets the bridge network's inference
-            case_id every time `load_case(k)` is called. Inherits
-            everything else from the real dataset class so it remains
-            a drop-in replacement."""
-
             def load_case(self, k):
                 # Set BEFORE delegating, so any side-effect during
                 # super().load_case (e.g. logging) cannot fire a forward
@@ -409,10 +294,6 @@ class nnUNetTrainerTextDensityBridge(nnUNetTrainer):
         finally:
             self.dataset_class = base_cls
             network_ref.set_inference_case_id(None)
-
-
-# --- short-schedule variants for the 3-day deadline ---------------------------
-
 
 class nnUNetTrainerTextDensityBridge_50epochs(nnUNetTrainerTextDensityBridge):
     def __init__(self, plans: dict, configuration: str, fold: int,
