@@ -1,26 +1,10 @@
-"""Canonical, paper-facing DTIS trainer.
-
-This class freezes the implementation used for the revised experiments:
-
-* image + aligned density are nnUNet modalities 0 and 1;
-* density-first, text-second cascaded bottleneck cross-attention;
-* Xavier output projections with learnable gates initialised to 0.05;
-* projected foreground-aware alignment, linearly warmed to lambda=0.1;
-* 250 training epochs.
-
-Historical V2--V7 trainers remain available for development, but manuscript
-tables should name this trainer and must not mix their checkpoints.
-"""
-
 from __future__ import annotations
-
 import hashlib
 import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from pydoc import locate
-
 import torch
 import torch.nn as nn
 
