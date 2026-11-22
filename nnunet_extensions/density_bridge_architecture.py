@@ -1,40 +1,11 @@
-# -*- coding: utf-8 -*-
-"""nnUNetv2 architecture wrapper that injects density at the decoder input.
-
-This keeps the official encoder/decoder modules from dynamic_network_architectures
-intact and only replaces the bottleneck feature that is fed into the decoder.
-
-Density branch design (current):
-- A 1-channel density input is consumed:
-    channel 0 = distribution  (gated positive lift over per-lung p25 baseline,
-                               zero outside the eroded inner lung mask)
-- DensityEncoder: Conv -> SpatialAttention -> Conv (stride 2) -> Conv ->
-  SpatialAttention -> Conv 1x1 projection to bottleneck channels.
-- Fusion is a residual multi-head Cross-Attention: Q from the image bottleneck,
-  K/V from the encoded density. This lets density CONTRIBUTE NEW INFORMATION
-  to the bottleneck (additive), not just rescale it.
-- The fusion strength is gated by a learnable scalar initialized to 0 so the
-  network starts identical to the official nnUNetv2 baseline.
-"""
-
 from __future__ import annotations
-
 import math
 from typing import List, Optional, Union
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from dynamic_network_architectures.architectures.unet import PlainConvUNet
-
 from nnunetv2.training.nnUNetTrainer.density_cache_utils import load_density
-
-
-# ---------------------------------------------------------------------------
-# Building blocks
-# ---------------------------------------------------------------------------
-
 
 class ConvBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
@@ -68,19 +39,7 @@ class SpatialAttention(nn.Module):
         attn = self.sigmoid(self.conv(attn))
         return x * attn
 
-
-# ---------------------------------------------------------------------------
-# Density encoder: 2 channels in, bottleneck_ch channels out
-# ---------------------------------------------------------------------------
-
-
 class DensityEncoder(nn.Module):
-    """Conv + SpatialAttention twice, then 1x1 projection.
-
-    Mirrors the topology shown in the project's framework diagram:
-        Conv2d -> SpatialAttention -> Conv2d (stride 2) -> ... -> Conv 1x1.
-    """
-
     def __init__(self, bottleneck_ch: int, in_channels: int = 1, base_ch: int = 32):
         super().__init__()
         self.stem = ConvBlock(in_channels, base_ch)
@@ -105,41 +64,7 @@ class DensityEncoder(nn.Module):
         x = self.proj(x)
         return x
 
-
-# ---------------------------------------------------------------------------
-# Input-conditioned fusion gate (replaces the single global scalar alpha)
-# ---------------------------------------------------------------------------
-
-
 class ConditionedGate(nn.Module):
-    """Input-conditioned replacement for the single global scalar fusion gate.
-
-    Motivation (empirical, from this project's density-vs-CLIP reliability probe
-    on CT (MosMed) + CXR (QaTa), slice-level bootstrap, n=300):
-      * The low-level density/opacity cue is a robustly reliable lesion signal
-        at EVERY lesion size (bootstrap AUC lower-bound >= 0.58 CT / 0.61 CXR),
-        while the high-level CLIP cue is unreliable per slice (AUC <= 0.5 on
-        small lesions, CI entirely below random). => density deserves a high,
-        often dominant fusion weight; text/CLIP should not drive dense fusion.
-      * The empirically optimal density weight w* is NOT constant: ~1.0 for
-        small / focal lesions, dropping to ~0.6 for large consolidations where
-        the image-only path is already strong. A SINGLE global scalar alpha is
-        therefore provably suboptimal -- it must compromise between regimes
-        (the documented 'alpha=1.0 over-injects on large lesions, -0.075 Dice'
-        failure is exactly this).
-
-    This module predicts the gate per sample (or per spatial location at
-    bottleneck resolution) from the pooled image bottleneck + density features,
-    bounded to (0, alpha_max).
-
-    Weak-/identity-start: the final layer's weight is zero-initialised and its
-    bias is set so every sample emits exactly `alpha_init` at step 0, exactly
-    reproducing the scalar-alpha baseline; the gate then specialises during
-    training. MUST be paired with `out_proj_init != 'zero'` in
-    CrossAttentionFusion: if the residual is identically zero at step 0 then
-    BOTH out_proj and this gate starve (no gradient escapes the origin).
-    """
-
     def __init__(self, channels: int, alpha_max: float = 1.0,
                  alpha_init: float = 0.05, spatial: bool = False,
                  hidden: Optional[int] = None):
@@ -171,35 +96,7 @@ class ConditionedGate(nn.Module):
         g = torch.sigmoid(self.net(torch.cat([b, d], dim=1))) * self.alpha_max
         return g.view(g.shape[0], 1, 1, 1)                         # (B, 1, 1, 1)
 
-
-# ---------------------------------------------------------------------------
-# Cross-attention fusion: Q from image bottleneck, K/V from density feature
-# ---------------------------------------------------------------------------
-
-
 class CrossAttentionFusion(nn.Module):
-    """Multi-head cross-attention with a learnable identity-start gate.
-
-    Forward:
-        out = bottleneck + alpha * CrossAttn(Q=bottleneck, K=V=density)
-
-    Identity-start design (fixes the 'alpha stuck at 0' failure mode):
-      * `out_proj.weight` is initialised to all zeros, so the cross-attention
-        output is exactly 0 at step 0. The bottleneck is therefore identical
-        to the official baseline at initialisation.
-      * `alpha` is a plain learnable scalar (NOT wrapped in tanh) initialised
-        to a small value (default 0.3). Empirically alpha=1.0 caused over-
-        injection on easy/large lesion cases (where the image-only baseline
-        is already near-perfect), degrading large-lesion Dice by ~0.075.
-        A smaller initial alpha keeps fusion as a *correction* rather than
-        a *dominant signal*, preserving the baseline's strengths while still
-        rescuing hard cases. It is exposed via the `.alpha` attribute and
-        is intended to be excluded from weight decay by the trainer.
-      * At the first step, gradients flow through `v_proj`/`q_proj`/`k_proj`
-        (which are randomly initialised); `out_proj` then receives a real
-        gradient signal and rapidly leaves zero.
-    """
-
     def __init__(self, channels: int, num_heads: int = 4, alpha_init: float = 0.3,
                  out_proj_init: str = 'zero', gate_mode: str = 'scalar',
                  alpha_max: float = 1.0):
@@ -218,19 +115,6 @@ class CrossAttentionFusion(nn.Module):
         self.k_proj = nn.Conv2d(self.channels, self.channels, kernel_size=1, bias=False)
         self.v_proj = nn.Conv2d(self.channels, self.channels, kernel_size=1, bias=False)
         self.out_proj = nn.Conv2d(self.channels, self.channels, kernel_size=1, bias=False)
-
-        # out_proj initialisation strategy. Two options:
-        # 'zero'   (legacy): bn_fused == bn_image at step 0, but the residual
-        #          path is starved -- d(seg_loss)/d(out_proj) is multiplicatively
-        #          near zero, so out_proj never escapes the origin. Validated
-        #          empirically on PCAT: after 78 epochs, ||out_proj|| = 0.20
-        #          (vs Q/K/V's ~9.0), so the cross-attention residual is ~2%
-        #          of the baseline signal -- effectively dead.
-        # 'xavier' (V2): out_proj starts non-zero, so even a tiny alpha gives
-        #          a real residual from step 0. Paired with `alpha_init=0.05`
-        #          this gives weak-but-active injection (5% magnitude) that
-        #          the optimiser can immediately tune up or down. Avoids the
-        #          residual-starvation collapse.
         op_init = (out_proj_init or 'zero').lower()
         if op_init == 'zero':
             nn.init.zeros_(self.out_proj.weight)
@@ -242,31 +126,7 @@ class CrossAttentionFusion(nn.Module):
             raise ValueError(
                 f"out_proj_init must be one of 'zero' / 'xavier' / 'kaiming', got {out_proj_init!r}")
         self._out_proj_init = op_init
-
-        # alpha is a plain learnable scalar. No tanh, no clipping. Under
-        # `out_proj_init='zero'`, alpha's magnitude is irrelevant at step 0
-        # (multiplied by zero anyway). Under `out_proj_init='xavier'`, alpha
-        # directly controls how strongly the residual is injected at step 0
-        # -- the recommended pairing is `alpha_init=0.05` (weak injection
-        # the optimiser can actively grow if useful, shrink if harmful).
-        # The trainer is responsible for excluding `alpha` from weight decay.
         self.alpha = nn.Parameter(torch.tensor(float(alpha_init)))
-
-        # gate_mode:
-        #   'scalar'       (default, backward-compatible): effective gate = self.alpha,
-        #                  a single global learnable scalar. Identical to the legacy
-        #                  behaviour -- nothing changes unless a caller opts in.
-        #   'cond'         per-SAMPLE gate predicted from pooled (bottleneck, density)
-        #                  features. Lets the network inject MORE density on small/
-        #                  focal-lesion images and LESS on large-consolidation images
-        #                  (the regime where a global alpha is forced to compromise).
-        #   'cond_spatial' per-LOCATION gate at bottleneck resolution (a (B,1,H,W)
-        #                  map): same idea but spatially resolved.
-        # In the conditioned modes `self.alpha` is retained (so trainers that read
-        # `.alpha` / exclude it from weight decay keep working) but is NOT applied
-        # to the residual; the conditioned gate replaces it. Conditioned modes REQUIRE
-        # out_proj_init != 'zero' (else the residual is 0 at step 0 and the gate
-        # starves) -- the density-bridge trainer already passes 'xavier'.
         self.gate_mode = (gate_mode or 'scalar').lower()
         if self.gate_mode not in ('scalar', 'cond', 'cond_spatial'):
             raise ValueError(
@@ -283,28 +143,11 @@ class CrossAttentionFusion(nn.Module):
             self.cond_gate = ConditionedGate(
                 self.channels, alpha_max=alpha_max, alpha_init=float(alpha_init),
                 spatial=(self.gate_mode == 'cond_spatial'))
-
-        # Diagnostic state -- populated in forward, read by trainer for FAR
-        # logging (Fusion Activation Ratio = ||gate*delta|| / ||bn_image||).
-        # See `nnUNetTrainerTextDensityBridgeV2.on_epoch_end` for usage.
         self._last_input_norm: Optional[torch.Tensor] = None
         self._last_delta_norm: Optional[torch.Tensor] = None
         self._last_gate_mean: Optional[torch.Tensor] = None
 
-    def forward(self, bottleneck: torch.Tensor, density_feat: torch.Tensor) -> torch.Tensor:
-        """Gated additive cross-attention fusion.
-
-        Args:
-            bottleneck: query feature (B, C, H, W).
-            density_feat: key/value feature (B, C, H, W).
-
-        Returns:
-            `bottleneck + alpha * MHCA(Q=bottleneck, K=V=density_feat)`.
-        """
-        # Pre-clear diagnostic state so callers that skip this forward
-        # (e.g. when their `density_feat is None` guard fires) cannot
-        # observe stale FAR readings from the previous batch. Symmetric
-        # with the same defence in `DualPathBottleneckFusion.forward`.
+    def forward(self, bottleneck: torch.Tensor, density_feat: torch.Tensor) -> torch.Tensor:   
         self._last_input_norm = None
         self._last_delta_norm = None
         self._last_gate_mean = None
@@ -356,12 +199,6 @@ def _largest_divisor_at_most(n: int, target: int) -> int:
 
 
 def _resolve_bottleneck_channels(encoder, init_kwargs: dict) -> int:
-    """Return the channel count of the encoder bottleneck (= deepest stage).
-
-    Prefers the encoder's runtime `output_channels` attribute, falls back to
-    the `features_per_stage` constructor argument. Always validates the value
-    so we never silently pass an empty list / 0 to downstream Conv layers.
-    """
     out_channels = getattr(encoder, "output_channels", None)
     if out_channels is not None and len(out_channels) > 0:
         ch = int(out_channels[-1])
@@ -377,20 +214,7 @@ def _resolve_bottleneck_channels(encoder, init_kwargs: dict) -> int:
         raise ValueError(f"Resolved bottleneck channel count must be positive, got {ch}.")
     return ch
 
-
-# ---------------------------------------------------------------------------
-# Wrapped nnUNetv2 PlainConvUNet with the density bridge attached
-# ---------------------------------------------------------------------------
-
-
 class DensityBridgePlainConvUNet(PlainConvUNet):
-    """Official nnUNetv2 2D U-Net with a density cross-attention bridge.
-
-    The encoder and decoder are unchanged. Only the deepest skip (= bottleneck)
-    is augmented by a cross-attention residual that consumes a 1-channel
-    density input (lung-confined gated distribution).
-    """
-
     def __init__(self, *args, density_base_ch: int = 32, density_in_channels: int = 1,
                  num_heads: int = 4, alpha_init: float = 0.3,
                  out_proj_init: str = 'zero', gate_mode: str = 'scalar',
@@ -398,11 +222,6 @@ class DensityBridgePlainConvUNet(PlainConvUNet):
                  allow_legacy_density_cache: bool = False,
                  require_aligned_density: bool = True,
                  **kwargs):
-        # nnUNet must see image+density as separate input modalities so its
-        # preprocessing, augmentation and sliding-window inference transform
-        # them with identical spatial coordinates. PlainConvUNet, however,
-        # must still receive image channels only. Adapt its constructor here
-        # instead of making every trainer variant duplicate this logic.
         density_in_channels = int(density_in_channels)
         args = list(args)
         if args:
@@ -434,15 +253,6 @@ class DensityBridgePlainConvUNet(PlainConvUNet):
             in_channels=self.density_in_channels,
             base_ch=density_base_ch,
         )
-        # `out_proj_init` newly exposed so trainers can opt into 'xavier'
-        # to avoid the residual-starvation collapse (alpha=0 + out_proj=0
-        # is a chain-locked dead branch -- gradient through alpha is
-        # multiplied by out=0, and gradient through out_proj is multiplied
-        # by alpha=0; neither parameter ever escapes the origin). See
-        # `CrossAttentionFusion.__init__` for the detailed analysis. The
-        # default is kept at 'zero' for backward compatibility, but the
-        # density bridge trainer now passes 'xavier' (paired with a small
-        # non-zero alpha_init).
         self.fusion = CrossAttentionFusion(
             channels=bottleneck_ch, num_heads=num_heads, alpha_init=alpha_init,
             out_proj_init=out_proj_init, gate_mode=gate_mode, alpha_max=alpha_max,
@@ -484,7 +294,6 @@ class DensityBridgePlainConvUNet(PlainConvUNet):
                 "preprocessing, and pass the two-channel tensor to the bridge."
             )
 
-        # case_id can be a single string or a list of strings (one per item).
         if isinstance(case_id, (list, tuple)):
             case_ids = [str(c) for c in case_id]
         else:
