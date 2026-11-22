@@ -35,5 +35,3 @@ image features, then uses a global text embedding to modulate the fused features
 The DTIS trainer and fusion architecture match the source checksums recorded
 for the August 24, 2026 QaTa-COV19 run. Reproducing that run requires the original
 density inputs, text embeddings, and dataset split. 
-
-The original manuscript reported **91.87% Dice**. 
